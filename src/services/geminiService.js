@@ -417,7 +417,8 @@ Provide an objective match score (0-100), explicit reasons behind the score, and
         skills: resumeData.skills,
         education: resumeData.education,
         certifications: resumeData.certifications,
-        projects: resumeData.projects
+        projects: resumeData.projects,
+        rawText: resumeData.rawText || ''
       }, null, 2);
 
   const prompt = `
@@ -467,7 +468,72 @@ Return a valid JSON object strictly matching this schema:
     return await callGemini(prompt, systemInstruction);
   } catch (err) {
     console.warn(`[Gemini Matching Warning]: ${err.message}. Using fallback alignment calculation...`);
-    const parsed = extractEntitiesFallback(typeof resumeData === 'string' ? resumeData : JSON.stringify(resumeData), jobDescription);
-    return parsed.jdMatch;
+    const candidateText = typeof resumeData === 'string'
+      ? resumeData
+      : [
+          resumeData.fullName,
+          resumeData.summary,
+          resumeData.rawText,
+          resumeData.currentDesignation,
+          resumeData.skills?.programmingLanguages,
+          resumeData.skills?.frameworks,
+          resumeData.skills?.tools,
+          resumeData.certifications,
+          resumeData.projects,
+          resumeData.experience?.flatMap(item => [item.designation, item.company, ...(item.responsibilities || [])])
+        ].flat(Infinity).filter(Boolean).join(' ');
+
+    const jdText = jobDescription.trim();
+    const jdLower = jdText.toLowerCase();
+    const candidateLower = candidateText.toLowerCase();
+    const matchingSkills = [];
+    const missingSkills = [];
+
+    for (const list of Object.values(KNOWN_SKILLS)) {
+      for (const skill of list) {
+        const escaped = skill.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (new RegExp(`\\b${escaped}\\b`, 'i').test(jdLower)) {
+          if (new RegExp(`\\b${escaped}\\b`, 'i').test(candidateLower)) {
+            if (!matchingSkills.includes(skill)) matchingSkills.push(skill);
+          } else if (!missingSkills.includes(skill)) {
+            missingSkills.push(skill);
+          }
+        }
+      }
+    }
+
+    const totalRequirements = matchingSkills.length + missingSkills.length;
+    const matchScore = totalRequirements
+      ? Math.round((matchingSkills.length / totalRequirements) * 100)
+      : 50;
+    const verdict = matchScore >= 75 ? 'Strong Match' : matchScore >= 50 ? 'Moderate Match' : 'Partial Match';
+
+    return {
+      matchScore,
+      scoreBreakdown: {
+        technicalSkills: matchScore,
+        experienceRelevance: 70,
+        educationFit: 75,
+        domainKnowledge: 65
+      },
+      verdict,
+      summary: `Candidate matches ${matchingSkills.length} detected requirement${matchingSkills.length === 1 ? '' : 's'} and has ${missingSkills.length} identified gap${missingSkills.length === 1 ? '' : 's'} for the target role.`,
+      reasons: [
+        matchingSkills.length
+          ? `Direct resume evidence was found for: ${matchingSkills.join(', ')}.`
+          : 'No direct evidence was found for the role skills detected in the JD.',
+        missingSkills.length
+          ? `No resume evidence was found for: ${missingSkills.join(', ')}.`
+          : 'No critical known-skill gaps were detected.'
+      ],
+      missingSkills,
+      matchingSkills,
+      strengths: matchingSkills.slice(0, 5),
+      gaps: missingSkills.slice(0, 5),
+      interviewQuestions: missingSkills.slice(0, 3).map(skill => `How would you apply ${skill} in this role?`),
+      recommendations: missingSkills.length
+        ? 'Interview to validate transferable experience and assess the identified skill gaps.'
+        : 'Proceed to interview and validate role-specific experience.'
+    };
   }
 }

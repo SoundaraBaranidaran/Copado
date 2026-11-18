@@ -161,18 +161,29 @@ export const parserController = {
       const candidateData = await parseResumeWithGemini(rawText, jobDescription);
       const matchResult = await matchResumeWithJobDescription(candidateData, jobDescription);
 
+      const normalizedMatch = {
+        ...matchResult,
+        matchScore: Number(matchResult?.matchScore) || 0,
+        reasons: Array.isArray(matchResult?.reasons) ? matchResult.reasons : [],
+        missingSkills: Array.isArray(matchResult?.missingSkills) ? matchResult.missingSkills : [],
+        matchingSkills: Array.isArray(matchResult?.matchingSkills) ? matchResult.matchingSkills : [],
+        strengths: Array.isArray(matchResult?.strengths) ? matchResult.strengths : [],
+        gaps: Array.isArray(matchResult?.gaps) ? matchResult.gaps : [],
+        interviewQuestions: Array.isArray(matchResult?.interviewQuestions) ? matchResult.interviewQuestions : []
+      };
+
       const candidate = {
         ...candidateData,
         fileName: file.originalname,
         fileSize: file.size,
         uploadedAt: new Date().toISOString(),
-        jdMatch: matchResult
+        jdMatch: normalizedMatch
       };
 
       return res.status(200).json({
         ok: true,
         data: candidate,
-        match: matchResult
+        match: normalizedMatch
       });
     } catch (err) {
       console.error('Error in parse and match:', err);

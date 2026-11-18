@@ -117,6 +117,13 @@ Evaluate candidate alignment against a Job Description.
 ### 4. `POST /api/parse-and-match`
 Upload resume and JD together to get both parsed candidate and in-depth match analysis in a single request.
 
+- **Content-Type**: `multipart/form-data`
+- **Fields**:
+  - `resume` or `file`: PDF or DOCX resume
+  - `jobDescription` or `jd`: Required JD text
+- **Returns**: Parsed candidate data plus `matchScore`, `missingSkills`,
+  `matchingSkills`, `reasons`, score breakdown, and recruiter recommendations.
+
 ---
 
 ## 📦 Setup & Installation
