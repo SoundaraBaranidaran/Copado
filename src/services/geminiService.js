@@ -112,6 +112,117 @@ const KNOWN_SKILLS = {
   ]
 };
 
+const SKILL_ALIASES = {
+  go: ['go', 'golang'],
+  golang: ['go', 'golang'],
+  react: ['react', 'react.js', 'reactjs'],
+  'react.js': ['react', 'react.js', 'reactjs'],
+  node: ['node', 'node.js', 'nodejs'],
+  'node.js': ['node', 'node.js', 'nodejs'],
+  express: ['express', 'express.js'],
+  'express.js': ['express', 'express.js'],
+  vue: ['vue', 'vue.js', 'vuejs'],
+  'vue.js': ['vue', 'vue.js', 'vuejs'],
+  aws: ['aws', 'amazon web services'],
+  'amazon web services': ['aws', 'amazon web services'],
+  gcp: ['gcp', 'google cloud', 'google cloud platform'],
+  'google cloud': ['gcp', 'google cloud', 'google cloud platform'],
+  postgresql: ['postgresql', 'postgres'],
+  mysql: ['mysql', 'sql'],
+  javascript: ['javascript', 'java script', 'js'],
+  typescript: ['typescript', 'type script']
+};
+
+function normalizeSkillName(skill) {
+  return String(skill || '').toLowerCase().trim().replace(/[^a-z0-9+#.-]+/g, '');
+}
+
+function skillIsInText(skill, text) {
+  if (!skill || !text) return false;
+  const aliases = SKILL_ALIASES[normalizeSkillName(skill)]
+    || SKILL_ALIASES[String(skill).toLowerCase().trim()]
+    || [String(skill).trim()];
+
+  return aliases.some(alias => {
+    const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?:^|[^a-z0-9+#])${escaped}(?:$|[^a-z0-9+#])`, 'i').test(text);
+  });
+}
+
+function flattenCandidateText(resumeData) {
+  if (typeof resumeData === 'string') return resumeData;
+  if (!resumeData || typeof resumeData !== 'object') return '';
+
+  return [
+    resumeData.fullName,
+    resumeData.summary,
+    resumeData.rawText,
+    resumeData.currentDesignation,
+    resumeData.skills?.programmingLanguages,
+    resumeData.skills?.frameworks,
+    resumeData.skills?.tools,
+    resumeData.certifications,
+    resumeData.projects,
+    resumeData.languages,
+    resumeData.experience?.flatMap(item => [
+      item?.designation, item?.company, item?.duration, ...(item?.responsibilities || [])
+    ]),
+    resumeData.education?.flatMap(item => [item?.degree, item?.specialization, item?.institution])
+  ].flat(Infinity).filter(value => value !== null && value !== undefined).join('\n');
+}
+
+function reconcileMissingSkills(matchResult, resumeData, jobDescription) {
+  if (!matchResult || typeof matchResult !== 'object') return matchResult;
+
+  const candidateText = flattenCandidateText(resumeData);
+  const jdText = jobDescription || '';
+  const jdSkills = [];
+  for (const category of Object.values(KNOWN_SKILLS)) {
+    for (const skill of category) {
+      if (skillIsInText(skill, jdText)
+        && !jdSkills.some(existing => skillIsInText(existing, skill) || skillIsInText(skill, existing))) {
+        jdSkills.push(skill);
+      }
+    }
+  }
+  for (const skill of [
+    ...(Array.isArray(matchResult.matchingSkills) ? matchResult.matchingSkills : []),
+    ...(Array.isArray(matchResult.missingSkills) ? matchResult.missingSkills : [])
+  ]) {
+    if (String(skill).trim() && skillIsInText(skill, jdText)
+      && !jdSkills.some(existing => skillIsInText(existing, skill) || skillIsInText(skill, existing))) {
+      jdSkills.push(skill);
+    }
+  }
+
+  const matchingSkills = [];
+  const missingSkills = [];
+  for (const skill of jdSkills) {
+    if (skillIsInText(skill, candidateText)) matchingSkills.push(skill);
+    else missingSkills.push(skill);
+  }
+
+  const total = matchingSkills.length + missingSkills.length;
+  if (total > 0) {
+    const technicalSkills = Math.round((matchingSkills.length / total) * 100);
+    matchResult.matchScore = Math.round((technicalSkills + (Number(matchResult.matchScore) || technicalSkills)) / 2);
+    matchResult.scoreBreakdown = { ...(matchResult.scoreBreakdown || {}), technicalSkills };
+  }
+  matchResult.matchingSkills = matchingSkills;
+  matchResult.missingSkills = missingSkills;
+  matchResult.verdict = matchResult.matchScore >= 75 ? 'Strong Match'
+    : matchResult.matchScore >= 50 ? 'Moderate Match'
+      : matchResult.matchScore >= 25 ? 'Partial Match' : 'Low Match';
+  matchResult.strengths = matchingSkills.slice(0, 5);
+  matchResult.gaps = missingSkills.slice(0, 5);
+  matchResult.summary = `Candidate directly evidences ${matchingSkills.length} of ${total} detected role skill requirement${total === 1 ? '' : 's'}.${missingSkills.length ? ` Remaining gaps: ${missingSkills.join(', ')}.` : ' No known-skill gaps were detected.'}`;
+  matchResult.reasons = [
+    matchingSkills.length ? `Direct resume evidence was found for: ${matchingSkills.join(', ')}.` : 'No direct resume evidence was found for the role skills detected in the JD.',
+    missingSkills.length ? `No resume evidence was found for: ${missingSkills.join(', ')}.` : 'No critical known-skill gaps were detected.'
+  ];
+  return matchResult;
+}
+
 /**
  * Intelligent local regex & NLP extractor that guarantees a valid candidate record
  * even if Google AI Studio is experiencing temporary severe demand spikes.
@@ -332,6 +443,10 @@ Additionally, evaluate this candidate against the following Job Description (JD)
 ${jobDescription.trim()}
 --- JOB DESCRIPTION END ---
 
+Important matching rule: compare every JD requirement against evidence anywhere in the resume text,
+including skills, experience responsibilities, projects, and certifications. Do not mark a skill as missing
+if the resume explicitly mentions it under any of those fields or uses a common name/alias for it.
+
 Include a "jdMatch" field in the root of the JSON response with this schema:
 "jdMatch": {
   "jobTitle": "Target role title inferred from JD",
@@ -383,7 +498,7 @@ Include a "jdMatch" field in the root of the JSON response with this schema:
       projects: Array.isArray(result.projects) ? result.projects : [],
       languages: Array.isArray(result.languages) ? result.languages : [],
       rawText: rawText,
-      jdMatch: result.jdMatch || null
+      jdMatch: reconcileMissingSkills(result.jdMatch, { ...result, rawText }, jobDescription)
     };
   } catch (err) {
     console.warn(`[Gemini API Warning]: ${err.message}. Activating intelligent local extraction pipeline...`);
@@ -465,7 +580,8 @@ Return a valid JSON object strictly matching this schema:
 `;
 
   try {
-    return await callGemini(prompt, systemInstruction);
+    const match = await callGemini(prompt, systemInstruction);
+    return reconcileMissingSkills(match, resumeData, jobDescription);
   } catch (err) {
     console.warn(`[Gemini Matching Warning]: ${err.message}. Using fallback alignment calculation...`);
     const candidateText = typeof resumeData === 'string'
