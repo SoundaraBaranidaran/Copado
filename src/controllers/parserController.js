@@ -159,7 +159,10 @@ export const parserController = {
 
       // Parse with Gemini including JD
       const candidateData = await parseResumeWithGemini(rawText, jobDescription);
-      const matchResult = await matchResumeWithJobDescription(candidateData, jobDescription);
+      const matchResult = candidateData.jdMatch
+        && (Array.isArray(candidateData.jdMatch.missingSkills) || Array.isArray(candidateData.jdMatch.matchingSkills))
+        ? candidateData.jdMatch
+        : await matchResumeWithJobDescription(candidateData, jobDescription);
 
       const normalizedMatch = {
         ...matchResult,

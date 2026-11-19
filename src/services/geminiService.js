@@ -1,6 +1,8 @@
 import { config } from '../config/env.js';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+const GEMINI_REQUEST_TIMEOUT_MS = 10000;
+const GEMINI_TOTAL_TIMEOUT_MS = 28000;
 
 /**
  * Executes a prompt against Google Gemini models with retries on 503/429 and automatic model fallbacks.
@@ -10,86 +12,83 @@ async function callGemini(prompt, systemInstruction = '') {
     throw new Error('Google Gemini API Key is missing. Please set Google_API_key in .env file.');
   }
 
-  const models = [
-    'gemini-3.5-flash-lite',
-    'gemini-flash-lite-latest',
-    'gemini-3.5-flash',
-    'gemini-3.8-flash',
-    'gemini-2.5-pro',
-    'gemini-flash-latest'
-  ];
-
+  const models = (config.geminiModels || []).slice(0, 3);
+  const deadline = Date.now() + GEMINI_TOTAL_TIMEOUT_MS;
   let lastError = null;
 
   for (const model of models) {
-    // Retry up to 2 times for each model if experiencing temporary 503 spikes
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${config.googleApiKey}`;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
 
-      const requestBody = {
-        contents: [
-          {
-            parts: [{ text: prompt }]
-          }
-        ],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.1
-        }
-      };
+    const controller = new AbortController();
+    const requestTimeout = setTimeout(
+      () => controller.abort(),
+      Math.min(GEMINI_REQUEST_TIMEOUT_MS, remaining)
+    );
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${config.googleApiKey}`;
+    const requestBody = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        temperature: 0.1
+      }
+    };
 
-      if (systemInstruction) {
-        requestBody.systemInstruction = {
-          parts: [{ text: systemInstruction }]
-        };
+    if (systemInstruction) {
+      requestBody.systemInstruction = { parts: [{ text: systemInstruction }] };
+    }
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal
+      });
+      const data = await response.json();
+
+      if (response.status === 503 || response.status === 429) {
+        lastError = new Error(`[${model}] Temporarily unavailable (HTTP ${response.status}).`);
+        await wait(Math.min(300, Math.max(0, deadline - Date.now())));
+        continue;
+      }
+
+      if (!response.ok) {
+        const errorMsg = data?.error?.message || `HTTP ${response.status}`;
+        console.warn(`Model ${model} returned error (${response.status}): ${errorMsg}.`);
+        lastError = new Error(`[${model}] ${errorMsg}`);
+        continue;
+      }
+
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) {
+        lastError = new Error(`Model ${model} returned empty content.`);
+        continue;
+      }
+
+      let cleaned = text.trim();
+      if (cleaned.startsWith('```json')) {
+        cleaned = cleaned.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+      } else if (cleaned.startsWith('```')) {
+        cleaned = cleaned.replace(/^```\s*/, '').replace(/\s*```$/, '');
       }
 
       try {
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(requestBody)
-        });
-
-        const data = await response.json();
-
-        if (response.status === 503 || response.status === 429) {
-          console.warn(`[${model}] Attempt ${attempt} returned status ${response.status} (High demand). Retrying in 1.5s...`);
-          await wait(1500 * attempt);
-          continue;
-        }
-
-        if (!response.ok) {
-          const errorMsg = data?.error?.message || `HTTP ${response.status}`;
-          console.warn(`Model ${model} returned error (${response.status}): ${errorMsg}.`);
-          lastError = new Error(`[${model}] ${errorMsg}`);
-          break; // Try next model in list
-        }
-
-        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (!text) {
-          lastError = new Error(`Model ${model} returned empty content.`);
-          break;
-        }
-
-        // Clean markdown code blocks if returned
-        let cleaned = text.trim();
-        if (cleaned.startsWith('```json')) {
-          cleaned = cleaned.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-        } else if (cleaned.startsWith('```')) {
-          cleaned = cleaned.replace(/^```\s*/, '').replace(/\s*```$/, '');
-        }
-
         return JSON.parse(cleaned);
       } catch (err) {
-        console.warn(`Error calling ${model} (attempt ${attempt}): ${err.message}.`);
-        lastError = err;
-        await wait(1000);
+        lastError = new Error(`[${model}] Returned invalid JSON: ${err.message}`);
       }
+    } catch (err) {
+      lastError = controller.signal.aborted
+        ? new Error(`[${model}] Request timed out after ${Math.min(GEMINI_REQUEST_TIMEOUT_MS, remaining)}ms.`)
+        : err;
+      console.warn(`Error calling ${model}: ${lastError.message}.`);
+    } finally {
+      clearTimeout(requestTimeout);
     }
   }
 
-  throw new Error(`All Gemini models failed. Last error: ${lastError?.message || 'Unknown error'}`);
+  throw new Error(`Gemini parsing failed within ${GEMINI_TOTAL_TIMEOUT_MS}ms. Last error: ${lastError?.message || 'No models are configured.'}`);
 }
 
 /**
